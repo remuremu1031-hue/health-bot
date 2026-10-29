@@ -5,6 +5,9 @@
   - Upstash Redis (REST) で統計・検知状態・設定を保存
   - ① デイリー健康レポート  ② ピリつき(メッセージバースト)検知
   - ③ 新規メンバー危険度レーティング  ④ ステータス連動
+  - 📡 稼働ステータスパネル (/set-status-channel)
+  - 🔑 ライセンス管理 (/activate-license, /check-license)
+  - 🛡️ セキュリティ強化 (レート制限 / 権限ガード / 入力検証 / 監査ログ)
 
 必要な環境変数:
   DISCORD_TOKEN, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
@@ -19,11 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
+import re
+import secrets
 import sys
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -376,6 +383,7 @@ class HealthBot(discord.Client):
             log.error("Slash command sync failed (%s)", safe_error(e))
         self.daily_report.start()
         self.presence_loop.start()
+        status_panel_loop.start()
 
     async def on_ready(self) -> None:
         log.info("Logged in. guilds=%d", len(self.guilds))
@@ -383,6 +391,7 @@ class HealthBot(discord.Client):
 
     async def on_error(self, event_method: str, *args: Any, **kwargs: Any) -> None:
         log.error("Unhandled error in %s (%s)", event_method, safe_error(sys.exc_info()[1]))
+        fire_and_forget(audit.error(event_method, sys.exc_info()[1]))
 
     # ── 設定ヘルパ ──
     async def cfg_channel(self, guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
@@ -550,6 +559,783 @@ bot = HealthBot()
 
 
 # ════════════════════════════════════════════════════════════
+# 🛡️ セキュリティ (レート制限 / ガード / 入力検証 / 監査ログ)
+# ════════════════════════════════════════════════════════════
+# ── [1] 入力検証・サニタイズ ──
+_SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}", re.ASCII)
+
+
+def parse_snowflake(value: Any) -> Optional[int]:
+    """DiscordのID(Snowflake)として妥当な整数のみ返す。"""
+    s = str(value).strip()
+    if not _SNOWFLAKE_RE.fullmatch(s):
+        return None
+    n = int(s)
+    return n if 0 < n < 2**63 else None
+
+
+def clean_text(value: Any, max_len: int = 200) -> str:
+    """NFKC正規化 + 制御文字/ゼロ幅文字の除去 + 空白の正規化 + 長さ制限。"""
+    s = unicodedata.normalize("NFKC", str(value))
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+    return re.sub(r"\s+", " ", s).strip()[:max_len]
+
+
+def safe_display(value: Any, max_len: int = 200) -> str:
+    """Embed/ログ表示用: サニタイズ + シークレット伏せ + Markdown/メンション無効化。"""
+    text = redact(clean_text(value, max_len))
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+
+
+# ── 設定 ──
+OWNER_IDS: set[int] = {
+    i for i in map(parse_snowflake, os.getenv("NEXUS_OWNER_IDS", "").replace(" ", "").split(",")) if i
+}
+AUDIT_CHANNEL_ID: Optional[int] = parse_snowflake(os.getenv("NEXUS_AUDIT_CHANNEL_ID", ""))
+_WEBHOOK_RE = re.compile(r"https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api/webhooks/[0-9]+/[\w\-]+")
+_wh_raw = os.getenv("NEXUS_AUDIT_WEBHOOK_URL", "").strip()
+AUDIT_WEBHOOK_URL = _wh_raw if _WEBHOOK_RE.fullmatch(_wh_raw) else ""
+if _wh_raw:
+    # Webhook URL自体がトークン。エラー文・ログに出ないよう伏せ字対象へ登録する
+    _SECRETS.extend(s for s in (_wh_raw, urlparse(_wh_raw).path) if len(s) >= 6)
+    _SECRETS.sort(key=len, reverse=True)
+    if not AUDIT_WEBHOOK_URL:
+        log.warning("NEXUS_AUDIT_WEBHOOK_URL の形式が不正なため、Webhook通知を無効化しました。")
+
+
+# ── [2] レート制限 ──
+class RateLimiter:
+    """固定ウィンドウ方式。limit=1 ならクールダウンとして動作する。"""
+
+    def __init__(self) -> None:
+        self._local: dict[str, tuple[int, float]] = {}
+
+    async def hit(self, scope: str, ident: int | str, limit: int, window: int) -> tuple[bool, int]:
+        """戻り値: (許可されたか, 拒否時の再試行までの秒数)"""
+        key = f"nexus:rl:{scope}:{ident}"
+        n = await redis.cmd("INCR", key)
+        if n is None:  # Redis障害 → メモリで代替 (fail-open にはしない)
+            return self._hit_local(key, limit, window)
+        n = to_int(n)
+        if n == 1:
+            await redis.cmd("EXPIRE", key, window)
+        if n <= limit:
+            return True, 0
+        ttl = to_int(await redis.cmd("TTL", key))
+        if ttl < 0:  # EXPIREが失敗して永久に残る事故の修復
+            await redis.cmd("EXPIRE", key, window)
+            ttl = window
+        return False, max(ttl, 1)
+
+    def _hit_local(self, key: str, limit: int, window: int) -> tuple[bool, int]:
+        now = time.monotonic()
+        count, reset = self._local.get(key, (0, 0.0))
+        if now >= reset:
+            count, reset = 0, now + window
+        count += 1
+        self._local[key] = (count, reset)
+        if len(self._local) > 5000:
+            self._local = {k: v for k, v in self._local.items() if v[1] > now}
+        return count <= limit, max(1, math.ceil(reset - now))
+
+
+limiter = RateLimiter()
+
+# ── [3] 例外 / ガード ──
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def fire_and_forget(coro: Any) -> None:
+    """応答を待たせずに実行する (3秒ルール対策)。タスクはGCされないよう保持する。"""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+class SafeguardError(app_commands.CheckFailure):
+    def __init__(self, user_message: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
+class NotAuthorized(SafeguardError):
+    pass
+
+
+class RateLimited(SafeguardError):
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"⏳ 実行が早すぎます。{retry_after}秒後にもう一度お試しください。")
+        self.retry_after = retry_after
+
+
+def guard(
+    level: str = "admin",
+    *,
+    limit: int = 1,
+    window: int = 5,
+    per: str = "user",
+    scope: Optional[str] = None,
+):
+    """実行時の権限検証 + レート制限を1つにまとめたデコレータ。
+    level: member=サーバー内の誰でも / admin=管理者(またはオーナー) / owner=サーバーオーナー / operator=運営者(NEXUS_OWNER_IDS)
+    per:   "user"=ユーザーごと / "guild"=サーバーごと
+    """
+    if level not in {"member", "admin", "owner", "operator"}:
+        raise ValueError(f"unknown guard level: {level}")
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        cmd = scope or (interaction.command.qualified_name if interaction.command else "unknown")
+        user, guild = interaction.user, interaction.guild
+        denied: Optional[str] = None
+        if level == "operator":
+            if user.id not in OWNER_IDS:
+                denied = "🔒 このコマンドは運営専用です。"
+        elif guild is None or not isinstance(user, discord.Member):
+            denied = "このコマンドはサーバー内でのみ使用できます。"
+        elif level == "admin" and not (interaction.permissions.administrator or user.id == guild.owner_id):
+            denied = "🔒 このコマンドは管理者のみ使用できます。"
+        elif level == "owner" and user.id != guild.owner_id:
+            denied = "🔒 このコマンドはサーバーオーナーのみ使用できます。"
+        if denied:
+            fire_and_forget(audit.denied(interaction, cmd))
+            raise NotAuthorized(denied)
+
+        ident = guild.id if (per == "guild" and guild is not None) else user.id
+        ok, retry = await limiter.hit(cmd, ident, limit, window)
+        if not ok:
+            raise RateLimited(retry)
+        return True
+
+    return app_commands.check(predicate)
+
+
+async def handle_safeguard_error(interaction: discord.Interaction, error: Exception) -> bool:
+    """on_tree_error から呼ぶ。ガード由来のエラーならユーザーに通知して True を返す。"""
+    if not isinstance(error, SafeguardError):
+        return False
+    with contextlib.suppress(Exception):
+        if interaction.response.is_done():
+            await interaction.followup.send(error.user_message, ephemeral=True)
+        else:
+            await interaction.response.send_message(error.user_message, ephemeral=True)
+    return True
+
+
+# ── [4] 監査ログ ──
+class AuditLogger:
+    """Webhook / 専用チャンネル / Redis(直近500件) の3か所へ記録する。失敗しても例外は投げない。"""
+
+    COLORS = {"success": 0x2ECC71, "info": 0x3498DB, "warn": 0xF1C40F, "critical": 0xE74C3C}
+    ICONS = {"success": "✅", "info": "📝", "warn": "⚠️", "critical": "🚨"}
+
+    async def record(
+        self,
+        event: str,
+        *,
+        severity: str = "info",
+        guild: Optional[discord.Guild] = None,
+        actor: Optional[discord.abc.User] = None,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        try:
+            e = discord.Embed(
+                title=f"{self.ICONS.get(severity, '📝')} {safe_display(event, 100)}",
+                color=self.COLORS.get(severity, 0x3498DB),
+                timestamp=discord.utils.utcnow(),
+            )
+            if actor is not None:
+                e.add_field(name="実行者", value=f"<@{actor.id}> (`{actor.id}`)", inline=True)
+            if guild is not None:
+                e.add_field(name="サーバー", value=f"{safe_display(guild.name, 60)} (`{guild.id}`)", inline=True)
+            for k, v in list((details or {}).items())[:10]:
+                e.add_field(name=safe_display(k, 40) or "—", value=safe_display(v, 300) or "—", inline=False)
+            e.set_footer(text="NEXUS｜Audit")
+            await asyncio.gather(
+                self._to_webhook(e),
+                self._to_channel(e),
+                self._to_redis(event, severity, guild, actor, details),
+                return_exceptions=True,
+            )
+        except Exception as ex:
+            log.warning("audit record failed (%s)", safe_error(ex))
+
+    async def _to_webhook(self, embed: discord.Embed) -> None:
+        if not AUDIT_WEBHOOK_URL:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                r = await c.post(
+                    AUDIT_WEBHOOK_URL,
+                    json={"username": "NEXUS Audit", "embeds": [embed.to_dict()], "allowed_mentions": {"parse": []}},
+                )
+                if not r.is_success:
+                    log.warning("Audit webhook returned HTTP %s", r.status_code)
+        except Exception as ex:
+            log.warning("Audit webhook failed (%s)", safe_error(ex))
+
+    async def _to_channel(self, embed: discord.Embed) -> None:
+        if not AUDIT_CHANNEL_ID:
+            return
+        try:
+            ch = bot.get_channel(AUDIT_CHANNEL_ID)
+            if ch is not None and hasattr(ch, "send"):
+                await ch.send(embed=embed)  # type: ignore[union-attr]
+        except Exception as ex:
+            log.warning("Audit channel failed (%s)", safe_error(ex))
+
+    async def _to_redis(self, event: str, severity: str, guild: Any, actor: Any, details: Optional[dict]) -> None:
+        payload = json.dumps(
+            {
+                "t": int(time.time()),
+                "event": clean_text(event, 100),
+                "sev": severity,
+                "guild": getattr(guild, "id", 0),
+                "actor": getattr(actor, "id", 0),
+                "details": {clean_text(k, 40): redact(clean_text(v, 200)) for k, v in (details or {}).items()},
+            },
+            ensure_ascii=False,
+        )
+        await redis.pipeline(["LPUSH", "nexus:audit:log", payload], ["LTRIM", "nexus:audit:log", 0, 499])
+
+    async def denied(self, interaction: discord.Interaction, command: str) -> None:
+        """権限のない実行の試行。連続しても通知が洪水にならないよう 60秒に3件まで。"""
+        ok, _ = await limiter.hit("audit-denied", interaction.user.id, 3, 60)
+        if ok:
+            await self.record(
+                "権限のないコマンド実行",
+                severity="warn",
+                guild=interaction.guild,
+                actor=interaction.user,
+                details={"コマンド": f"/{command}"},
+            )
+
+    async def error(self, where: str, exc: Optional[BaseException], guild: Optional[discord.Guild] = None) -> None:
+        """重大エラーの通知。同じ場所からは5分に3件まで。"""
+        ident = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(where))[:40]
+        ok, _ = await limiter.hit("audit-error", ident, 3, 300)
+        if ok:
+            await self.record(
+                "重大エラー",
+                severity="critical",
+                guild=guild,
+                details={"発生箇所": where, "内容": safe_error(exc)},
+            )
+
+
+audit = AuditLogger()
+
+
+async def audit_license_result(interaction: discord.Interaction, raw_key: str, result: Any) -> None:
+    """/activate-license の結果を記録する (キーは常に伏せ字)。"""
+    key = normalize_key(raw_key)
+    masked = mask_key(key) if key else f"(形式不正・{len(clean_text(raw_key, 64))}文字)"
+    await audit.record(
+        "ライセンス認証成功" if result.ok else "ライセンス認証失敗",
+        severity="success" if result.ok else "warn",
+        guild=interaction.guild,
+        actor=interaction.user,
+        details={"キー": masked, "結果": result.code},
+    )
+
+
+async def audit_config_change(interaction: discord.Interaction, setting: str, channel: Any) -> None:
+    """重要な設定変更を記録する。"""
+    await audit.record(
+        "設定変更",
+        severity="info",
+        guild=interaction.guild,
+        actor=interaction.user,
+        details={"項目": setting, "設定値": f"#{getattr(channel, 'name', '?')} ({getattr(channel, 'id', '?')})"},
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# 📡 稼働ステータスパネル
+# ════════════════════════════════════════════════════════════
+PANEL_TITLE = "📡 NEXUS｜Dr.サーバー 稼働ステータス"
+PANEL_SCAN_LIMIT = 10  # パネル探索で遡るメッセージ数
+
+
+class StatusPanelManager:
+    """稼働ステータスパネル(Embed)の生成・探索・送信/更新を担当する。"""
+
+    def __init__(self, client: discord.Client) -> None:
+        self.bot = client
+        self._locks: dict[int, asyncio.Lock] = {}  # 同一サーバーでの二重投稿防止
+
+    def _lock(self, guild_id: int) -> asyncio.Lock:
+        return self._locks.setdefault(guild_id, asyncio.Lock())
+
+    async def build_embed(self) -> discord.Embed:
+        ready = self.bot.is_ready()
+        latency = self.bot.latency if ready else float("nan")
+        db = await redis.ping()  # "ok" / "error" / "disabled"
+
+        bot_text = "🟢 オンライン" if ready else "🟡 起動中"
+        ping_text = f"`{round(latency * 1000)} ms`" if math.isfinite(latency) else "計測中"
+        db_text = {
+            "ok": "🟢 正常",
+            "error": "🔴 接続エラー",
+            "disabled": "⚪ 未設定",
+        }.get(db, "⚪ 不明")
+
+        if db == "error":
+            color = 0xE74C3C
+        elif not ready or db == "disabled":
+            color = 0xF1C40F
+        else:
+            color = 0x2ECC71
+
+        e = discord.Embed(title=PANEL_TITLE, color=color, timestamp=discord.utils.utcnow())
+        e.add_field(name="🤖 ボット状態", value=bot_text, inline=True)
+        e.add_field(name="⚡ 応答速度", value=ping_text, inline=True)
+        e.add_field(name="🗄️ データベース", value=db_text, inline=True)
+        e.add_field(name="🌐 導入サーバー数", value=f"**{len(self.bot.guilds):,}** サーバー", inline=False)
+        e.set_footer(text="NEXUS｜5分ごとに自動更新")
+        return e
+
+    async def find_panel(self, channel: discord.TextChannel) -> Optional[discord.Message]:
+        """直近のメッセージから、Bot自身が送った稼働ステータスパネルを探す。"""
+        me = self.bot.user
+        if me is None:
+            return None
+        async for msg in channel.history(limit=PANEL_SCAN_LIMIT):
+            if msg.author.id == me.id and msg.embeds and msg.embeds[0].title == PANEL_TITLE:
+                return msg
+        return None
+
+    async def upsert(
+        self,
+        guild: discord.Guild,
+        embed: discord.Embed,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> bool:
+        """パネルがあれば edit、無ければ新規送信。成功したら True。"""
+        channel = channel or await self.bot.cfg_channel(guild, "status_channel")  # type: ignore[attr-defined]
+        if channel is None:
+            return False
+        async with self._lock(guild.id):
+            try:
+                panel = await self.find_panel(channel)
+                if panel is not None:
+                    try:
+                        await panel.edit(embed=embed)
+                        return True
+                    except discord.NotFound:
+                        pass  # 探索〜編集の間に消された → 新規送信へ
+                await channel.send(embed=embed)
+                return True
+            except discord.Forbidden:
+                # 履歴が読めないまま送ると毎回新規投稿になるため、ここでは何もしない
+                log.warning("Status panel: missing permission (guild=%s)", guild.id)
+            except discord.HTTPException as e:
+                log.warning("Status panel: HTTP error (guild=%s, %s)", guild.id, safe_error(e))
+            return False
+
+    async def update_all(self) -> None:
+        """全サーバーのパネルを更新する (Redisは1回のMGETでまとめて取得)。"""
+        guilds = list(self.bot.guilds)
+        if not guilds:
+            return
+        embed = await self.build_embed()
+        raw = await redis.cmd("MGET", *[k_cfg(g.id, "status_channel") for g in guilds])
+        ids = raw if isinstance(raw, list) else [None] * len(guilds)
+        for guild, cid in zip(guilds, ids):
+            if not cid:
+                continue
+            ch = guild.get_channel(to_int(cid))
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            try:
+                await self.upsert(guild, embed, ch)
+            except Exception as e:
+                log.error("Status panel update failed (guild=%s, %s)", guild.id, safe_error(e))
+            await asyncio.sleep(1)  # レート制限への配慮
+
+
+panels = StatusPanelManager(bot)
+
+
+@tasks.loop(minutes=5)
+async def status_panel_loop() -> None:
+    try:
+        await panels.update_all()
+    except Exception as e:  # ループを止めない
+        log.error("status_panel_loop failed (%s)", safe_error(e))
+
+
+@status_panel_loop.before_loop
+async def _before_status_panel_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="set-status-channel", description="稼働ステータスパネルを表示するチャンネルを設定します")
+@app_commands.describe(channel="パネルを送信・自動更新するテキストチャンネル")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@guard("admin", limit=3, window=30, per="guild")
+async def set_status_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    guild = interaction.guild
+    assert guild is not None
+    perms = channel.permissions_for(guild.me)
+    missing = [
+        n
+        for n, ok in (
+            ("チャンネルを見る", perms.view_channel),
+            ("メッセージを送信", perms.send_messages),
+            ("埋め込みリンク", perms.embed_links),
+            ("メッセージ履歴を読む", perms.read_message_history),
+        )
+        if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            f"⚠️ {channel.mention} でBotに必要な権限が足りません: {', '.join(missing)}", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    if await redis.cmd("SET", k_cfg(guild.id, "status_channel"), channel.id) != "OK":
+        await interaction.followup.send("⚠️ 設定の保存に失敗しました。しばらくしてからお試しください。", ephemeral=True)
+        return
+
+    sent = await panels.upsert(guild, await panels.build_embed(), channel)
+    msg = (
+        f"✅ {channel.mention} に稼働ステータスパネルを設定しました。5分ごとに自動更新されます。"
+        if sent
+        else f"⚠️ 設定は保存しましたが、{channel.mention} へのパネル送信に失敗しました。権限を確認してください。"
+    )
+    await interaction.followup.send(msg, ephemeral=True)
+    await audit_config_change(interaction, "ステータスパネルのチャンネル", channel)
+
+
+# ════════════════════════════════════════════════════════════
+# 🔑 NEXUS ライセンス管理
+# ════════════════════════════════════════════════════════════
+LICENSE_PREFIX = "nexus:lic:"
+LICENSE_KEY_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{7,63}$")
+LICENSE_FAIL_LIMIT = 5  # 認証失敗の上限回数
+LICENSE_FAIL_WINDOW = 600  # 上記の集計時間(秒)
+LICENSE_CACHE_SEC = 60  # guild_is_licensed のキャッシュ秒数
+_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 0/O, 1/I を除外
+_FAIL_CODES = {"NOT_FOUND", "INVALID_FORMAT", "INACTIVE", "EXPIRED", "GUILD_MISMATCH"}
+
+# 検証 + 自動バインドを1コマンドで原子的に実行する Lua (同時認証でも二重バインドしない)
+_LICENSE_BIND_LUA = """
+local k = KEYS[1]
+if redis.call('EXISTS', k) == 0 then return {'NOT_FOUND'} end
+if redis.call('HGET', k, 'is_active') ~= '1' then return {'INACTIVE'} end
+local owner = redis.call('HGET', k, 'owner_id') or '0'
+local exp = tonumber(redis.call('HGET', k, 'expires_at') or '0') or 0
+if exp > 0 and exp <= tonumber(ARGV[2]) then
+  return {'EXPIRED', owner, '0', string.format('%d', exp)}
+end
+local gid = redis.call('HGET', k, 'guild_id') or '0'
+local bound = '0'
+if gid == '0' then
+  redis.call('HSET', k, 'guild_id', ARGV[1])
+  gid = ARGV[1]
+  bound = '1'
+elseif gid ~= ARGV[1] then
+  return {'GUILD_MISMATCH'}
+end
+return {'OK', owner, gid, string.format('%d', exp), bound}
+"""
+
+
+class LicenseBackendError(Exception):
+    """Redis に接続できない等、ライセンス情報を取得できなかった場合。"""
+
+
+@dataclass(frozen=True)
+class LicenseInfo:
+    key: str
+    owner_id: int
+    guild_id: int
+    expires_at: int  # 0 = 無期限
+    is_active: bool
+
+
+@dataclass(frozen=True)
+class LicenseResult:
+    code: str  # OK / NOT_FOUND / INVALID_FORMAT / INACTIVE / EXPIRED / GUILD_MISMATCH / RATE_LIMITED / ERROR
+    info: Optional[LicenseInfo] = None
+    newly_bound: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.code == "OK"
+
+
+def normalize_key(raw: str) -> Optional[str]:
+    key = re.sub(r"[‐‑‒–—−]", "-", clean_text(raw or "", 64)).upper()
+    return key if LICENSE_KEY_RE.match(key) else None
+
+
+def mask_key(key: str) -> str:
+    """ログ・表示用にキーを伏せる (例: NEXUS-****-****-****-DDDD)。"""
+    parts = key.split("-")
+    if len(parts) < 3:
+        return key[:2] + "****"
+    return f"{parts[0]}-" + "-".join("****" for _ in parts[1:-1]) + f"-{parts[-1]}"
+
+
+class NexusLicenseManager:
+    """ライセンスの発行・検証・自動バインド・期限チェック・無効化(BAN)を管理する。"""
+
+    def __init__(self) -> None:
+        self._cache: dict[int, tuple[float, bool]] = {}
+
+    @staticmethod
+    def _k(key: str) -> str:
+        return f"{LICENSE_PREFIX}{key}"
+
+    # ── 発行 / 管理 ──
+    async def issue(self, owner_id: int, days: Optional[int] = None) -> str:
+        """新しいキーを発行する。days 省略で無期限。"""
+        if not redis.enabled:
+            raise LicenseBackendError("Redis is not configured")
+        key = ""
+        for _ in range(5):
+            key = "NEXUS-" + "-".join(
+                "".join(secrets.choice(_KEY_ALPHABET) for _ in range(4)) for _ in range(4)
+            )
+            if to_int(await redis.cmd("EXISTS", self._k(key))) == 0:
+                break
+        else:
+            raise LicenseBackendError("could not generate a unique key")
+        expires = int(time.time()) + days * 86400 if days and days > 0 else 0
+        res = await redis.cmd(
+            "HSET", self._k(key), "owner_id", owner_id, "guild_id", 0, "expires_at", expires, "is_active", 1
+        )
+        if res is None:
+            raise LicenseBackendError("failed to store license")
+        log.info("License issued (%s)", mask_key(key))
+        return key
+
+    async def _set_field(self, raw_key: str, field: str, value: int) -> bool:
+        key = normalize_key(raw_key)
+        if key is None or to_int(await redis.cmd("EXISTS", self._k(key))) == 0:
+            return False
+        ok = await redis.cmd("HSET", self._k(key), field, value) is not None
+        self._cache.clear()
+        if ok:
+            log.info("License %s updated (%s)", field, mask_key(key))
+        return ok
+
+    async def revoke(self, key: str) -> bool:
+        """無効化(BAN)。"""
+        return await self._set_field(key, "is_active", 0)
+
+    async def restore(self, key: str) -> bool:
+        """無効化を解除。"""
+        return await self._set_field(key, "is_active", 1)
+
+    async def unbind(self, key: str) -> bool:
+        """サーバーとの紐付けを解除 (次回の認証で再バインド)。"""
+        return await self._set_field(key, "guild_id", 0)
+
+    # ── 参照 / 判定 ──
+    async def inspect(self, key: str) -> Optional[LicenseInfo]:
+        """キーの情報を返す。存在しなければ None、Redis 障害時は LicenseBackendError。"""
+        raw = await redis.cmd("HGETALL", self._k(key))
+        if raw is None:
+            raise LicenseBackendError("redis unavailable")
+        if not raw:
+            return None
+        d = dict(zip(raw[0::2], raw[1::2]))
+        return LicenseInfo(
+            key=key,
+            owner_id=to_int(d.get("owner_id")),
+            guild_id=to_int(d.get("guild_id")),
+            expires_at=to_int(d.get("expires_at")),
+            is_active=str(d.get("is_active")) == "1",
+        )
+
+    @staticmethod
+    def evaluate(info: Optional[LicenseInfo], guild_id: int) -> str:
+        """読み取り専用の判定 (バインドはしない)。"""
+        if info is None:
+            return "NOT_FOUND"
+        if not info.is_active:
+            return "INACTIVE"
+        if info.expires_at and info.expires_at <= int(time.time()):
+            return "EXPIRED"
+        if info.guild_id and info.guild_id != guild_id:
+            return "GUILD_MISMATCH"
+        return "OK"
+
+    async def guild_is_licensed(self, guild_id: int) -> bool:
+        """サーバーが有効なライセンスを持つか (60秒キャッシュ)。有料機能のゲート用。"""
+        now = time.monotonic()
+        hit = self._cache.get(guild_id)
+        if hit and now - hit[0] < LICENSE_CACHE_SEC:
+            return hit[1]
+        try:
+            key = await redis.cmd("GET", k_cfg(guild_id, "licensed_key"))
+            ok = bool(key) and self.evaluate(await self.inspect(str(key)), guild_id) == "OK"
+        except Exception as e:
+            log.warning("License check failed (%s)", safe_error(e))
+            return False  # 障害時は未ライセンス扱い (キャッシュしない)
+        self._cache[guild_id] = (now, ok)
+        return ok
+
+    # ── 認証 (検証 + 自動バインド) ──
+    async def validate_and_bind(self, raw_key: str, guild_id: int) -> LicenseResult:
+        key = normalize_key(raw_key)
+        if key is None:
+            return LicenseResult("INVALID_FORMAT")
+        res = await redis.cmd("EVAL", _LICENSE_BIND_LUA, 1, self._k(key), guild_id, int(time.time()))
+        if not isinstance(res, list) or not res:
+            return LicenseResult("ERROR")
+        code = str(res[0])
+        if code == "OK" and len(res) >= 5:
+            info = LicenseInfo(key, to_int(res[1]), to_int(res[2]), to_int(res[3]), True)
+            return LicenseResult("OK", info, newly_bound=str(res[4]) == "1")
+        if code == "EXPIRED" and len(res) >= 4:
+            return LicenseResult("EXPIRED", LicenseInfo(key, to_int(res[1]), 0, to_int(res[3]), True))
+        return LicenseResult(code)
+
+    async def activate(self, guild_id: int, user_id: int, raw_key: str) -> LicenseResult:
+        """/activate-license の本体。総当たり対策 → 検証/バインド → サーバー設定へ保存。"""
+        fail_key = f"nexus:licfail:{user_id}"
+        if to_int(await redis.cmd("GET", fail_key)) >= LICENSE_FAIL_LIMIT:
+            return LicenseResult("RATE_LIMITED")
+
+        result = await self.validate_and_bind(raw_key, guild_id)
+        if result.code in _FAIL_CODES:
+            await redis.incr_ttl(fail_key, LICENSE_FAIL_WINDOW)
+        if not result.ok or result.info is None:
+            return result
+
+        saved = await redis.cmd("SET", k_cfg(guild_id, "licensed_key"), result.info.key) == "OK"
+        if not saved:
+            return LicenseResult("ERROR")
+        self._cache.pop(guild_id, None)
+        log.info("License activated (guild=%s, key=%s)", guild_id, mask_key(result.info.key))
+        return result
+
+
+licenses = NexusLicenseManager()
+
+# ── 表示 ──
+_LICENSE_STATE: dict[str, tuple[str, int, str]] = {
+    "OK": ("🟢 有効", 0x2ECC71, "ライセンスは有効です。"),
+    "INACTIVE": ("🔴 無効", 0xE74C3C, "このライセンスは無効化されています。"),
+    "EXPIRED": ("🟠 期限切れ", 0xE67E22, "このライセンスは有効期限が切れています。"),
+    "GUILD_MISMATCH": ("🔒 別サーバーに紐付け済み", 0xE74C3C, "このライセンスは別のサーバーで使用されています。"),
+    "NOT_FOUND": ("⚪ 不明", 0x95A5A6, "ライセンスキーが見つかりません。入力内容をご確認ください。"),
+    "INVALID_FORMAT": ("⚪ 不明", 0x95A5A6, "ライセンスキーが見つかりません。入力内容をご確認ください。"),
+    "RATE_LIMITED": ("⏳ 試行制限中", 0xF1C40F, "認証の失敗が続いたため、10分ほど待ってから再度お試しください。"),
+    "ERROR": ("⚠️ エラー", 0xF1C40F, "ライセンスの確認中にエラーが発生しました。時間をおいて再度お試しください。"),
+}
+
+
+def license_expiry_text(ts: int) -> str:
+    return "無期限" if ts == 0 else f"<t:{ts}:F>（<t:{ts}:R>）"
+
+
+def license_embed(
+    code: str, info: Optional[LicenseInfo] = None, *, title: str = "🔑 NEXUS ライセンス", newly_bound: bool = False
+) -> discord.Embed:
+    label, color, text = _LICENSE_STATE.get(code, _LICENSE_STATE["ERROR"])
+    e = discord.Embed(title=title, description=f"**{label}**\n{text}", color=color, timestamp=discord.utils.utcnow())
+    if info is not None:
+        e.add_field(name="🔖 ライセンスキー", value=f"`{mask_key(info.key)}`", inline=False)
+        e.add_field(name="📅 有効期限", value=license_expiry_text(info.expires_at), inline=False)
+        if code == "OK":
+            bind_text = "このサーバーに紐付けました（初回認証）" if newly_bound else "このサーバー"
+            e.add_field(name="🏠 紐付け先", value=bind_text, inline=False)
+    e.set_footer(text="NEXUS｜ライセンス管理")
+    return e
+
+
+# ── スラッシュコマンド ──
+@bot.tree.command(name="activate-license", description="ライセンスキーを認証して、このサーバーに登録します")
+@app_commands.describe(key="ライセンスキー（例: NEXUS-XXXX-XXXX-XXXX-XXXX）")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@guard("admin", limit=3, window=60)
+async def activate_license(interaction: discord.Interaction, key: app_commands.Range[str, 8, 64]) -> None:
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.defer(ephemeral=True)  # キーが他のメンバーに見えないよう自分だけに表示
+    result = await licenses.activate(guild.id, interaction.user.id, key)
+    await interaction.followup.send(
+        embed=license_embed(
+            result.code, result.info, title="🔑 NEXUS ライセンス認証", newly_bound=result.newly_bound
+        ),
+        ephemeral=True,
+    )
+    await audit_license_result(interaction, key, result)
+
+
+@bot.tree.command(name="check-license", description="このサーバーのライセンス状態を確認します")
+@app_commands.guild_only()
+@guard("member", limit=3, window=10)
+async def check_license(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.defer(ephemeral=True)
+    key = await redis.cmd("GET", k_cfg(guild.id, "licensed_key"))
+    if not key:
+        await interaction.followup.send(
+            "ℹ️ このサーバーにはライセンスが登録されていません。\n管理者は `/activate-license` で登録できます。",
+            ephemeral=True,
+        )
+        return
+    try:
+        info = await licenses.inspect(str(key))
+        code = licenses.evaluate(info, guild.id)
+    except LicenseBackendError:
+        info, code = None, "ERROR"
+    await interaction.followup.send(embed=license_embed(code, info, title="🔑 NEXUS ライセンス状態"), ephemeral=True)
+
+
+# ── 運営専用コマンド (ライセンスの無効化/復活) ──
+# 運営専用: ライセンスの無効化(BAN)/復活。NEXUS_OWNER_IDS に入っているユーザーだけが実行できます。
+async def _license_admin_action(interaction: discord.Interaction, key: str, reason: str, *, revoke: bool) -> None:
+    await interaction.response.defer(ephemeral=True)
+    ok = await (licenses.revoke(key) if revoke else licenses.restore(key))
+    norm = normalize_key(key)
+    masked = mask_key(norm) if norm else "(形式不正)"
+    label = "無効化" if revoke else "復活"
+    await audit.record(
+        f"ライセンス{label}" + ("" if ok else "（失敗）"),
+        severity=("critical" if revoke else "info") if ok else "warn",
+        guild=interaction.guild,
+        actor=interaction.user,
+        details={"キー": masked, "理由": reason or "（未入力）"},
+    )
+    await interaction.followup.send(
+        f"✅ `{masked}` を{label}しました。（反映まで最大60秒）" if ok else "❌ 対象のライセンスが見つかりません。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="license-revoke", description="【運営専用】ライセンスを無効化(BAN)します")
+@app_commands.describe(key="対象のライセンスキー", reason="理由（監査ログに記録されます）")
+@guard("operator", limit=3, window=60)
+async def license_revoke(
+    interaction: discord.Interaction,
+    key: app_commands.Range[str, 8, 64],
+    reason: app_commands.Range[str, 0, 200] = "",
+) -> None:
+    await _license_admin_action(interaction, key, reason, revoke=True)
+
+
+@bot.tree.command(name="license-restore", description="【運営専用】無効化したライセンスを復活します")
+@app_commands.describe(key="対象のライセンスキー", reason="理由（監査ログに記録されます）")
+@guard("operator", limit=3, window=60)
+async def license_restore(
+    interaction: discord.Interaction,
+    key: app_commands.Range[str, 8, 64],
+    reason: app_commands.Range[str, 0, 200] = "",
+) -> None:
+    await _license_admin_action(interaction, key, reason, revoke=False)
+
+
+# ════════════════════════════════════════════════════════════
 # スラッシュコマンド (管理者専用)
 # ════════════════════════════════════════════════════════════
 async def _save_channel(
@@ -581,13 +1367,16 @@ async def _save_channel(
     if name == "alert_channel" and channel.permissions_for(interaction.guild.default_role).view_channel:
         msg += "\n⚠️ このチャンネルは**一般メンバーにも見える状態**です。管理者専用にすることをおすすめします。"
     await interaction.response.send_message(msg, ephemeral=True)
+    await audit_config_change(
+        interaction, {"report_channel": "レポート送信先", "alert_channel": "警告ログ送信先"}.get(name, name), channel
+    )
 
 
 @bot.tree.command(name="set-report-channel", description="デイリー健康レポートの送信先チャンネルを設定します")
 @app_commands.describe(channel="レポートを投稿するチャンネル")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@guard("admin", limit=3, window=30, per="guild")
 async def set_report_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
     await _save_channel(interaction, channel, "report_channel", "健康レポートの送信先")
 
@@ -596,7 +1385,7 @@ async def set_report_channel(interaction: discord.Interaction, channel: discord.
 @app_commands.describe(channel="警告ログを投稿する管理者専用チャンネル")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@guard("admin", limit=3, window=30, per="guild")
 async def set_alert_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
     await _save_channel(interaction, channel, "alert_channel", "警告ログの送信先")
 
@@ -604,7 +1393,7 @@ async def set_alert_channel(interaction: discord.Interaction, channel: discord.T
 @bot.tree.command(name="health-check", description="今日の健康カルテを今すぐ表示します(自分だけに表示)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@guard("admin", limit=1, window=30, per="guild")
 async def health_check(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
     await interaction.response.defer(ephemeral=True)
@@ -625,10 +1414,17 @@ async def health_check(interaction: discord.Interaction) -> None:
 
 @bot.tree.error
 async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    if await handle_safeguard_error(interaction, error):
+        return
     if isinstance(error, app_commands.MissingPermissions):
         msg = "🔒 このコマンドは管理者のみ使用できます。"
+    elif isinstance(error, app_commands.CheckFailure):
+        msg = "このコマンドは現在実行できません。"
     else:
         log.error("Command error (%s)", safe_error(error))
+        fire_and_forget(
+            audit.error(f"command:{getattr(interaction.command, 'name', '?')}", error, interaction.guild)
+        )
         msg = "⚠️ 診察中にトラブルが発生しました。時間をおいて再度お試しください。"
     with contextlib.suppress(Exception):
         if interaction.response.is_done():
@@ -661,6 +1457,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         with contextlib.suppress(Exception):
+            status_panel_loop.cancel()
             await bot.close()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
