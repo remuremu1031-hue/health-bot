@@ -305,7 +305,7 @@ def risk_score(member: discord.Member) -> tuple[int, list[str]]:
 # ════════════════════════════════════════════════════════════
 # Embed ビルダー
 # ════════════════════════════════════════════════════════════
-FOOTER = "NEXUS｜サーバー健康診断"
+FOOTER = "Dr.サーバー｜サーバー健康診断"
 
 
 def burst_embed(message: discord.Message, count: int, users: int) -> discord.Embed:
@@ -854,7 +854,7 @@ async def audit_config_change(interaction: discord.Interaction, setting: str, ch
 # ════════════════════════════════════════════════════════════
 # 📡 稼働ステータスパネル
 # ════════════════════════════════════════════════════════════
-PANEL_TITLE = "📡 NEXUS｜ 稼働ステータス"
+PANEL_TITLE = "📡 NEXUS｜Dr.サーバー 稼働ステータス"
 PANEL_SCAN_LIMIT = 10  # パネル探索で遡るメッセージ数
 
 
@@ -971,11 +971,10 @@ async def _before_status_panel_loop() -> None:
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name="set-status-channel", description="稼働ステータスパネルを表示するチャンネルを設定します")
+@bot.tree.command(name="set-status-channel", description="【BOT所有者専用】稼働ステータスパネルを表示するチャンネルを設定します")
 @app_commands.describe(channel="パネルを送信・自動更新するテキストチャンネル")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@guard("admin", limit=3, window=30, per="guild")
+@guard("operator", limit=3, window=30, per="guild")  # NEXUS_OWNER_IDS のユーザーのみ実行可
 async def set_status_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
     guild = interaction.guild
     assert guild is not None
@@ -1417,10 +1416,10 @@ async def health_check(interaction: discord.Interaction) -> None:
 # ════════════════════════════════════════════════════════════
 # 📜 利用規約 (/terms コマンド + Webページ /terms)
 # ════════════════════════════════════════════════════════════
-TERMS_TITLE = "NEXUS 利用規約"
+TERMS_TITLE = "Dr.サーバー 利用規約"
 TERMS_UPDATED = "最終更新日：2026年10月29日"
 TERMS_INTRO = (
-    "この利用規約（以下、「本規約」）は、霊夢(remuremu17)（以下、「当方」）が提供するDiscordボット「NEXUS」（以下、「本ボット」）の利用条件を定めるものです。"
+    "この利用規約（以下、「本規約」）は、霊夢(remuremu17)（以下、「当方」）が提供するDiscordボット「Dr.サーバー」（以下、「本ボット」）の利用条件を定めるものです。"
     "本ボットを利用するすべてのユーザー（以下、「ユーザー」）は、本規約に同意したものとみなされます。"
 )
 # (条文見出し, 本文の行リスト)。本文は原文のまま保持する。「・」で始まる行は箇条書きとして表示する。
