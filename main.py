@@ -7,6 +7,7 @@
   - ③ 新規メンバー危険度レーティング  ④ ステータス連動
   - 📡 稼働ステータスパネル (/set-status-channel)
   - 🔑 ライセンス管理 (/activate-license, /check-license)
+  - 📜 利用規約 (/terms コマンド, Web: /terms)
   - 🛡️ セキュリティ強化 (レート制限 / 権限ガード / 入力検証 / 監査ログ)
 
 必要な環境変数:
@@ -35,6 +36,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
+from html import escape as html_escape
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -44,7 +46,7 @@ import uvicorn
 from discord import app_commands
 from discord.ext import tasks
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 try:  # .env があれば読む (無くても動く)
     from dotenv import load_dotenv
@@ -1412,6 +1414,123 @@ async def health_check(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+# ════════════════════════════════════════════════════════════
+# 📜 利用規約 (/terms コマンド + Webページ /terms)
+# ════════════════════════════════════════════════════════════
+TERMS_TITLE = "Dr.サーバー 利用規約"
+TERMS_UPDATED = "最終更新日：2026年10月29日"
+TERMS_INTRO = (
+    "この利用規約（以下、「本規約」）は、霊夢(remuremu17)（以下、「当方」）が提供するDiscordボット「Dr.サーバー」（以下、「本ボット」）の利用条件を定めるものです。"
+    "本ボットを利用するすべてのユーザー（以下、「ユーザー」）は、本規約に同意したものとみなされます。"
+)
+# (条文見出し, 本文の行リスト)。本文は原文のまま保持する。「・」で始まる行は箇条書きとして表示する。
+TERMS_ARTICLES: list[tuple[str, list[str]]] = [
+    (
+        "第1条（適用）",
+        ["本規約は、ユーザーと当方との間の本ボットの利用に関わる一切の関係に適用されます。"],
+    ),
+    (
+        "第2条（機能と利用）",
+        [
+            "本ボットは、Discordサーバーの健康状態の計測、メッセージの急増（バースト）検知、および新規参加メンバーの危険度レーティング機能を提供します。",
+            "ユーザーは、Discordの利用規約およびコミュニティガイドラインを遵守し、自己の責任において本ボットを利用するものとします。",
+        ],
+    ),
+    (
+        "第3条（禁止事項）",
+        [
+            "ユーザーは、本ボットの利用にあたり、以下の行為を行ってはならないものとします。",
+            "・本ボットのシステムに過度な負荷をかける行為、またはハッキングや不正アクセスを試みる行為",
+            "・本ボットの脆弱性を突く行為、リバースエンジニアリング、その他運営を妨害する行為",
+            "・法令、公序良俗、またはDiscordの利用規約に違反する目的での利用",
+            "・その他、当方が不適切と判断する行為",
+        ],
+    ),
+    (
+        "第4条（免責事項）",
+        [
+            "当方は、本ボットの動作にバグや中断がないことを保証するものではありません。",
+            "本ボットの利用または利用不能によってユーザーに生じた損害について、当方に故意または重大な過失がある場合を除き、一切の責任を負いません。",
+            "システムのメンテナンスや外部ホスティングサービスの仕様変更等により、本ボットのサービスが予告なく停止・終了する場合があります。",
+        ],
+    ),
+]
+
+# 公開URL (任意)。設定すると /terms の Embed タイトルがWeb版へのリンクになる。
+_PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+TERMS_URL = f"{_PUBLIC_BASE}/terms" if re.fullmatch(r"https?://\S+", _PUBLIC_BASE) else ""
+
+
+def _terms_blocks(lines: list[str]) -> list[str]:
+    """連続する「・」の行を1つのブロックにまとめる (文言は加工しない)。"""
+    blocks: list[str] = []
+    for line in lines:
+        if line.startswith("・") and blocks and blocks[-1].startswith("・"):
+            blocks[-1] += "\n" + line
+        else:
+            blocks.append(line)
+    return blocks
+
+
+def terms_embed() -> discord.Embed:
+    e = discord.Embed(title=TERMS_TITLE, description=TERMS_INTRO, color=0x2A9DFF, url=TERMS_URL or None)
+    for heading, lines in TERMS_ARTICLES:
+        e.add_field(name=heading, value="\n\n".join(_terms_blocks(lines)), inline=False)
+    e.set_footer(text=TERMS_UPDATED)
+    return e
+
+
+_TERMS_CSS = """
+:root{color-scheme:light dark;--bg:#f6f8fa;--card:#fff;--text:#1f2328;--muted:#656d76;--accent:#2a9dff;--line:#d8dee4}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--text:#e6edf3;--muted:#8b949e;--line:#30363d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);line-height:1.9;
+  font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP","Yu Gothic",Meiryo,sans-serif}
+main{max-width:760px;margin:0 auto;padding:40px 20px 64px}
+h1{margin:0 0 4px;font-size:1.7rem}
+.updated{margin:0 0 28px;color:var(--muted);font-size:.9rem}
+.intro,section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:0 0 16px}
+section h2{margin:0 0 10px;font-size:1.1rem;padding-left:10px;border-left:4px solid var(--accent)}
+section p{margin:0 0 10px}
+.bullets{list-style:none;margin:0 0 10px;padding:0}
+.bullets li{padding-left:1em;text-indent:-1em;margin:2px 0}
+"""
+
+
+def _terms_html() -> str:
+    parts = [
+        f"<h1>{html_escape(TERMS_TITLE)}</h1>",
+        f'<p class="updated">{html_escape(TERMS_UPDATED)}</p>',
+        f'<p class="intro">{html_escape(TERMS_INTRO)}</p>',
+    ]
+    for heading, lines in TERMS_ARTICLES:
+        parts.append(f"<section><h2>{html_escape(heading)}</h2>")
+        for block in _terms_blocks(lines):
+            if block.startswith("・"):
+                items = "".join(f"<li>{html_escape(x)}</li>" for x in block.split("\n"))
+                parts.append(f'<ul class="bullets">{items}</ul>')
+            else:
+                parts.append(f"<p>{html_escape(block)}</p>")
+        parts.append("</section>")
+    body = "\n".join(parts)
+    return (
+        '<!doctype html><html lang="ja"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{html_escape(TERMS_TITLE)}</title><style>{_TERMS_CSS}</style></head>"
+        f"<body><main>{body}</main></body></html>"
+    )
+
+
+TERMS_HTML = _terms_html()
+
+
+@bot.tree.command(name="terms", description="Dr.サーバーの利用規約を表示します")
+@app_commands.guild_only()
+@guard("member", limit=3, window=30)
+async def terms_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(embed=terms_embed(), ephemeral=True)
+
+
 @bot.tree.error
 async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     if await handle_safeguard_error(interaction, error):
@@ -1472,6 +1591,11 @@ app = FastAPI(title="Dr.Server", lifespan=lifespan, docs_url=None, redoc_url=Non
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root() -> dict[str, str]:
     return {"message": "🩺 Dr.サーバー、診察中です。"}
+
+
+@app.api_route("/terms", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def terms_page() -> HTMLResponse:
+    return HTMLResponse(TERMS_HTML, headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])  # UptimeRobot は HEAD を使うことがある
