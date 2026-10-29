@@ -7,6 +7,7 @@
   - ③ 新規メンバー危険度レーティング  ④ ステータス連動
   - 📡 稼働ステータスパネル (/set-status-channel)
   - 🔑 ライセンス管理 (/activate-license, /check-license)
+  - 📢 ブロードキャスト (/set-broadcast-channel, /broadcast, /broadcast-info)
   - 📜 利用規約 (/terms コマンド, Web: /terms)
   - 🛡️ セキュリティ強化 (レート制限 / 権限ガード / 入力検証 / 監査ログ)
 
@@ -1528,6 +1529,309 @@ TERMS_HTML = _terms_html()
 @guard("member", limit=3, window=30)
 async def terms_command(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=terms_embed(), ephemeral=True)
+
+
+# ════════════════════════════════════════════════════════════
+# 📢 ブロードキャスト (運営 → 全導入サーバーへのお知らせ)
+# ════════════════════════════════════════════════════════════
+BROADCAST_FALLBACK_NOTICE = (
+    "お知らせ用チャンネルを設定しない場合、お知らせはサーバーの一番上（デフォルト）のテキストチャンネルに送信されます（フォールバック）。"
+    "意図しないチャンネルに届くのを避けるため、`/set-broadcast-channel` で送信先を明示的に設定してください。"
+)
+BROADCAST_FALLBACK_FOOTNOTE = (
+    "お知らせ用チャンネルが未設定（または利用できない）ため、サーバーの一番上のチャンネルに送信されました。"
+    "管理者は `/set-broadcast-channel` で送信先を指定できます。"
+)
+BROADCAST_SEND_INTERVAL = 0.6  # 1サーバーごとの送信間隔(秒)。レート制限への配慮
+_broadcast_lock: Optional[asyncio.Lock] = None
+
+
+def _get_broadcast_lock() -> asyncio.Lock:
+    global _broadcast_lock
+    if _broadcast_lock is None:  # 起動前のイベントループに紐付かないよう遅延生成
+        _broadcast_lock = asyncio.Lock()
+    return _broadcast_lock
+
+
+# ── [1] 入力整形 / 配信先の解決 ──
+def clean_announcement(value: Any, max_len: int, *, multiline: bool) -> str:
+    """お知らせ用の整形。全角記号を変えないよう NFKC は使わず、制御文字とゼロ幅文字だけを除去する。"""
+    s = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    for ch in s:
+        if ch == "\n":
+            out.append("\n" if multiline else " ")
+        elif ch == "\t":
+            out.append(" ")
+        elif ch == "\u200d" or unicodedata.category(ch)[0] != "C":  # ZWJは絵文字の結合に必要
+            out.append(ch)
+    text = re.sub(r"[ \u3000]+\n", "\n", "".join(out))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:max_len]
+
+
+def _can_post(ch: discord.TextChannel, me: Optional[discord.Member]) -> bool:
+    if me is None:
+        return False
+    p = ch.permissions_for(me)
+    return bool(p.view_channel and p.send_messages and p.embed_links)
+
+
+def top_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """サーバーの一番上のテキストチャンネル (Botが送信できる最初のもの)。フォールバック先。"""
+    for ch in guild.text_channels:  # 表示順(上から下)
+        if _can_post(ch, guild.me):
+            return ch
+    return None
+
+
+async def resolve_targets(
+    guilds: list[discord.Guild],
+) -> Optional[list[tuple[discord.Guild, Optional[discord.TextChannel], bool]]]:
+    """各サーバーの配信先を決める。戻り値の各要素は (サーバー, 送信先, フォールバックか)。
+    Redisから設定を取得できない場合は None (設定済みサーバーを誤ってフォールバックさせないため、配信を中止する)。"""
+    if not guilds:
+        return []
+    raw = await redis.cmd("MGET", *[k_cfg(g.id, "broadcast_channel") for g in guilds])
+    if not isinstance(raw, list) or len(raw) != len(guilds):
+        return None
+    plan: list[tuple[discord.Guild, Optional[discord.TextChannel], bool]] = []
+    for guild, cid in zip(guilds, raw):
+        ch = guild.get_channel(to_int(cid)) if cid else None
+        if isinstance(ch, discord.TextChannel) and _can_post(ch, guild.me):
+            plan.append((guild, ch, False))
+        else:
+            plan.append((guild, top_channel(guild), True))  # 未設定・削除済み・権限なし → 一番上のチャンネル
+    return plan
+
+
+# ── [2] Embed / 配信処理 / UI ──
+def build_announcement_embed(title: str, body: str, *, fallback: bool = False) -> discord.Embed:
+    e = discord.Embed(title=f"📢 {title}", description=body, color=0x2A9DFF, timestamp=discord.utils.utcnow())
+    if fallback:
+        e.add_field(name="ℹ️ このお知らせについて", value=BROADCAST_FALLBACK_FOOTNOTE, inline=False)
+    e.set_footer(text="NEXUS｜運営からのお知らせ")
+    return e
+
+
+async def broadcast_announcement(title: str, body: str) -> Optional[dict[str, int]]:
+    """全導入サーバーへ配信する。Redis障害時は何も送らず None を返す。"""
+    plan = await resolve_targets(list(bot.guilds))
+    if plan is None:
+        return None
+    stats = {"sent": 0, "fallback": 0, "no_target": 0, "failed": 0}
+    for guild, ch, is_fallback in plan:
+        if ch is None:
+            stats["no_target"] += 1
+            continue
+        try:
+            await ch.send(embed=build_announcement_embed(title, body, fallback=is_fallback))
+            stats["fallback" if is_fallback else "sent"] += 1
+        except discord.Forbidden:
+            stats["failed"] += 1
+        except Exception as e:
+            stats["failed"] += 1
+            log.warning("broadcast failed (guild=%s, %s)", guild.id, safe_error(e))
+        await asyncio.sleep(BROADCAST_SEND_INTERVAL)
+    return stats
+
+
+def _plan_summary(plan: list[tuple[discord.Guild, Optional[discord.TextChannel], bool]]) -> str:
+    configured = sum(1 for _, ch, fb in plan if ch is not None and not fb)
+    fallback = sum(1 for _, ch, fb in plan if ch is not None and fb)
+    none = sum(1 for _, ch, _ in plan if ch is None)
+    return (
+        "📋 **配信プレビュー**（下のEmbedが配信されます）\n"
+        f"・導入サーバー数: {len(plan)}\n"
+        f"・お知らせ用チャンネル設定済み: {configured}\n"
+        f"・⚠️ 未設定/利用不可 → 一番上のチャンネルへフォールバック: {fallback}\n"
+        f"・送信先なし（送信可能なチャンネルがない）: {none}\n"
+        "※ 配信は取り消せません。内容を確認してから送信してください。"
+    )
+
+
+class BroadcastConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, ann_title: str, ann_body: str) -> None:
+        super().__init__(timeout=180)
+        self.owner_id, self.ann_title, self.ann_body = owner_id, ann_title, ann_body
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id or interaction.user.id not in OWNER_IDS:
+            await interaction.response.send_message("🔒 この操作は実行者本人のみ行えます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="全サーバーへ送信", style=discord.ButtonStyle.danger, emoji="📢")
+    async def send_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        lock = _get_broadcast_lock()
+        if lock.locked():
+            await interaction.response.send_message("⏳ 別の配信が実行中です。完了までお待ちください。", ephemeral=True)
+            return
+        async with lock:
+            for item in self.children:
+                item.disabled = True  # type: ignore[attr-defined]
+            await interaction.response.edit_message(content="📤 配信中です…（完了までお待ちください）", view=self)
+            self.stop()
+            try:
+                stats = await broadcast_announcement(self.ann_title, self.ann_body)
+            except Exception as e:
+                log.error("broadcast crashed (%s)", safe_error(e))
+                fire_and_forget(audit.error("broadcast", e))
+                stats = None
+            if stats is None:
+                await interaction.edit_original_response(
+                    content="❌ 配信を中止しました（設定の取得に失敗）。時間をおいて再度お試しください。", embed=None, view=None
+                )
+                return
+            await interaction.edit_original_response(
+                content=(
+                    "✅ 配信が完了しました。\n"
+                    f"・設定済みチャンネルへ送信: {stats['sent']}\n"
+                    f"・フォールバック（一番上のチャンネル）へ送信: {stats['fallback']}\n"
+                    f"・送信先なし: {stats['no_target']}\n"
+                    f"・失敗（権限不足など）: {stats['failed']}"
+                ),
+                embed=None,
+                view=None,
+            )
+            await audit.record(
+                "お知らせ一斉配信",
+                severity="info",
+                actor=interaction.user,
+                details={
+                    "件名": self.ann_title,
+                    "設定済みへ送信": stats["sent"],
+                    "フォールバック送信": stats["fallback"],
+                    "送信先なし": stats["no_target"],
+                    "失敗": stats["failed"],
+                },
+            )
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="🚫 配信をキャンセルしました。", embed=None, view=None)
+
+
+class BroadcastModal(discord.ui.Modal, title="📢 お知らせの作成"):
+    subject = discord.ui.TextInput(label="件名", style=discord.TextStyle.short, min_length=1, max_length=100)
+    body = discord.ui.TextInput(
+        label="本文",
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=1500,
+        placeholder="全導入サーバーに配信されます。送信前にプレビューで確認できます。",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id not in OWNER_IDS:  # 念のため再検証
+            await interaction.response.send_message("🔒 このコマンドは運営専用です。", ephemeral=True)
+            return
+        title = clean_announcement(self.subject.value, 100, multiline=False)
+        body = clean_announcement(self.body.value, 1500, multiline=True)
+        if not title or not body:
+            await interaction.response.send_message("⚠️ 件名と本文を入力してください。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        plan = await resolve_targets(list(bot.guilds))
+        if plan is None:
+            await interaction.followup.send(
+                "❌ 配信先の設定をRedisから取得できませんでした。誤配信を防ぐため中止しました。", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            content=_plan_summary(plan),
+            embed=build_announcement_embed(title, body),
+            view=BroadcastConfirmView(interaction.user.id, title, body),
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.error("BroadcastModal error (%s)", safe_error(error))
+        fire_and_forget(audit.error("broadcast-modal", error))
+        with contextlib.suppress(Exception):
+            msg = "⚠️ お知らせの作成中にエラーが発生しました。"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+
+
+# ── [3] コマンド ──
+@bot.tree.command(
+    name="set-broadcast-channel",
+    description="運営からのお知らせを受け取るチャンネルを設定（未設定だと一番上のチャンネルに届きます）",
+)
+@app_commands.describe(channel="お知らせを受け取るチャンネル（未設定の場合は一番上のチャンネルに届きます）")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@guard("admin", limit=3, window=30, per="guild")
+async def set_broadcast_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    guild = interaction.guild
+    assert guild is not None
+    perms = channel.permissions_for(guild.me)
+    missing = [
+        n
+        for n, ok in (
+            ("チャンネルを見る", perms.view_channel),
+            ("メッセージを送信", perms.send_messages),
+            ("埋め込みリンク", perms.embed_links),
+        )
+        if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            f"⚠️ {channel.mention} でBotに必要な権限が足りません: {', '.join(missing)}", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    if await redis.cmd("SET", k_cfg(guild.id, "broadcast_channel"), channel.id) != "OK":
+        await interaction.followup.send("⚠️ 設定の保存に失敗しました。しばらくしてからお試しください。", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"✅ 運営からのお知らせの送信先を {channel.mention} に設定しました。\n"
+        f"ℹ️ {BROADCAST_FALLBACK_NOTICE}",
+        ephemeral=True,
+    )
+    await audit_config_change(interaction, "お知らせ受信チャンネル", channel)
+
+
+@bot.tree.command(
+    name="broadcast-info",
+    description="お知らせの送信先を確認します（未設定だと一番上のチャンネルに届きます）",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@guard("admin", limit=3, window=30, per="guild")
+async def broadcast_info(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.defer(ephemeral=True)
+    raw = await redis.cmd("GET", k_cfg(guild.id, "broadcast_channel"))
+    ch = guild.get_channel(to_int(raw)) if raw else None
+    if isinstance(ch, discord.TextChannel) and _can_post(ch, guild.me):
+        msg = (
+            f"📢 お知らせの送信先: {ch.mention}\n"
+            "変更するには `/set-broadcast-channel` を使用してください。\n"
+            f"ℹ️ {BROADCAST_FALLBACK_NOTICE}"
+        )
+    else:
+        fb = top_channel(guild)
+        reason = "未設定" if not raw else "設定済みのチャンネルが削除された、またはBotに送信権限がない状態"
+        msg = (
+            f"⚠️ お知らせ用チャンネルが{reason}です。\n{BROADCAST_FALLBACK_NOTICE}\n"
+            f"現在の送信先（フォールバック）: {fb.mention if fb else '送信可能なチャンネルがありません'}"
+        )
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(
+    name="broadcast",
+    description="【運営専用】全サーバーのお知らせ用チャンネルへ一斉配信（未設定のサーバーは一番上のチャンネルへ）",
+)
+@guard("operator", limit=3, window=60)
+async def broadcast_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_modal(BroadcastModal())
 
 
 @bot.tree.error
